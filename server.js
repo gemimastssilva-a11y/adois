@@ -8,6 +8,7 @@
  *   STRIPE_WEBHOOK_SECRET → validação dos webhooks de assinatura
  *   META_APP_ID / META_APP_SECRET → OAuth BYO da Meta
  *   VERIFY_TOKEN → handshake do webhook da Meta
+ *   SUPABASE_URL / SUPABASE_KEY → persistência + limites freemium
  */
 const http = require("http");
 const crypto = require("crypto");
@@ -19,6 +20,34 @@ const LLM_BASE = process.env.LLM_BASE_URL || "https://api.openai.com/v1";
 const LLM_MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
 const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || "";
 const STRIPE_WHSEC = process.env.STRIPE_WEBHOOK_SECRET || "";
+const META_APP_ID = process.env.META_APP_ID || "";
+const META_APP_SECRET = process.env.META_APP_SECRET || "";
+const ENC_KEY = process.env.ENC_KEY || crypto.createHash("sha256").update(META_APP_SECRET).digest("hex").slice(0, 32);
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://qeteccwfeefgsictgopv.supabase.co";
+const SUPABASE_KEY = process.env.SUPABASE_KEY || "";
+
+/* ---------- Supabase (persistência) ---------- */
+async function supaRPC(fn, args){
+  if (!SUPABASE_KEY) return null;
+  const r = await fetch(SUPABASE_URL + "/rest/v1/rpc/" + fn, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY },
+    body: JSON.stringify(args)
+  });
+  if (!r.ok) throw new Error("supabase " + fn + " HTTP " + r.status);
+  return r.json();
+}
+
+/* limite do freemium: 50/1000/2000 por plano */
+async function dentroDoLimite(){
+  if (!SUPABASE_KEY) return true; // sem banco configurado, não bloqueia
+  try {
+    const data = await supaRPC("listar_usuarios_canal", { p_canal: "whatsapp" });
+    if (!data || !data.length) return true;
+    const lim = await supaRPC("checar_limite", { p_usuario: data[0] });
+    return !lim || lim.uso_hoje < lim.limite;
+  } catch (e) { console.error("limite:", e.message); return true; }
+}
 
 const PLANOS = {
   gratuito: { preco_centavos: 0, prompts_chat: 3, checkins_semana: 1, encontros_guiados: false, padroes_conflito: false },
@@ -228,8 +257,6 @@ function stripeWebhookValido(raw, sig){
 }
 
 /* ---------- OAuth BYO (Meta) — o usuário conecta a PRÓPRIA conta ---------- */
-const META_APP_ID = process.env.META_APP_ID || "";
-const META_APP_SECRET = process.env.META_APP_SECRET || "";
 const OAUTH_REDIRECT = process.env.OAUTH_REDIRECT_URI || "https://SEU-DOMINIO/oauth/callback";
 const PERMS_WHATSAPP = "whatsapp_business_messaging,whatsapp_business_management,business_management";
 
@@ -281,7 +308,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  /* mensagens recebidas (Meta) → valida assinatura → fila → IA */
+  /* mensagens recebidas (Meta) → valida assinatura → fila → IA → persistência */
   if (url.pathname === "/webhook" && req.method === "POST"){
     corpo(b => {
       if (META_APP_SECRET && !metaWebhookValido(b, req.headers["x-hub-signature-256"])) {
@@ -296,7 +323,16 @@ const server = http.createServer((req, res) => {
         const sug = await gerar(msg.texto, {});
         metricas.msgs_recebidas++; metricas.analises++; metricas.latencia_total_ms += sug.latencia_ms;
         console.log(`[${msg.canal}] ${msg.nome}: "${msg.texto}" -> ${sug.intencao} (${sug.latencia_ms}ms, ${sug.motor})`);
-        // produção: persistir no Supabase (salvar_sugestoes) + push WebSocket para o painel
+        // persistência completa no Supabase (conversa + mensagem + 3 sugestões)
+        try {
+          if (await dentroDoLimite()) {
+            const conv = await supaRPC("registrar_webhook", {
+              p_canal: msg.canal, p_contato_id: msg.contatoId, p_contato_nome: msg.nome,
+              p_texto: msg.texto, p_resultado: sug
+            });
+            if (conv) console.log("  → salvo no Supabase (conversa " + conv.slice(0,8) + ")");
+          } else console.log("  → limite do plano atingido, sugestão não gerada");
+        } catch (e) { console.error("  persistência:", e.message); }
       }});
       agendar();
       json(200, { ok: true });
@@ -345,13 +381,27 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  /* OAuth: callback (troca code por token) */
+  /* OAuth: callback (troca code por token, criptografa e salva no Supabase) */
   if (url.pathname === "/oauth/callback" && req.method === "GET"){
     const code = url.searchParams.get("code");
     if (!code) return json(400, { erro: "sem code" });
-    trocarPorToken(code).then(tok => {
-      contasConectadas.push({ canal: "whatsapp", token: tok.access_token, conectado_em: new Date().toISOString() });
-      json(200, { ok: true, canal: "whatsapp", mensagem: "Conta conectada! Nenhuma mensagem é enviada por nós — só analisamos." });
+    trocarPorToken(code).then(async tok => {
+      // AES-256-GCM: token nunca fica em claro nem em RAM persistente
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv("aes-256-gcm", Buffer.from(ENC_KEY, "hex"), iv);
+      const enc = Buffer.concat([cipher.update(tok.access_token, "utf8"), cipher.final()]);
+      const tag = cipher.getAuthTag();
+      const tokenCriptografado = iv.toString("hex") + ":" + tag.toString("hex") + ":" + enc.toString("hex");
+      let salvo = false;
+      try {
+        const data = await supaRPC("listar_usuarios_canal", { p_canal: "whatsapp" });
+        if (data && data.length) {
+          await supaRPC("salvar_canal", { p_usuario: data[0], p_canal: "whatsapp", p_conta_id: "oauth_" + Date.now(), p_token_criptografado: tokenCriptografado });
+          salvo = true;
+        }
+      } catch (e) { console.error("salvar_canal:", e.message); }
+      contasConectadas.push({ canal: "whatsapp", conectado_em: new Date().toISOString(), salvo_no_banco: salvo });
+      json(200, { ok: true, canal: "whatsapp", token_salvo_criptografado: salvo, mensagem: "Conta conectada! Nenhuma mensagem é enviada por nós — só analisamos." });
     }).catch(e => json(500, { erro: e.message }));
     return;
   }
@@ -372,4 +422,5 @@ server.listen(PORT, () => {
   console.log(`  IA: ${LLM_KEY ? LLM_MODEL + " (" + LLM_BASE + ")" : "MODO FALLBACK (regras) — defina LLM_API_KEY"}`);
   console.log(`  Stripe: ${STRIPE_KEY ? "configurado" : "não configurado — defina STRIPE_SECRET_KEY"}`);
   console.log(`  Meta OAuth: ${META_APP_ID ? "configurado" : "não configurado — defina META_APP_ID/META_APP_SECRET"}`);
+  console.log(`  Supabase: ${SUPABASE_KEY ? "persistência ativa" : "sem persistência — defina SUPABASE_KEY"}`);
 });
